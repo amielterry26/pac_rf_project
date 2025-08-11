@@ -1,0 +1,73 @@
+# ============================================================
+#  CMake Configuration for pac_rf_exec
+#  Modular, future-proof, and cross-platform (macOS + PAC-RF)
+# ============================================================
+
+cmake_minimum_required(VERSION 3.10)
+
+# Project setup
+project(pac_rf_exec C)
+
+# Use C11 for modern features, while still portable
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# ============================================================
+#  Architecture-Specific Compiler Flags
+# ============================================================
+# On Linux (PAC-RF or Ubuntu VM): optimize for ARMv7 + NEON
+# On macOS (Darwin): safe flags for local Apple Silicon development
+# ============================================================
+if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    message(STATUS "Building for Linux/ARM (PAC-RF)")
+    set(CMAKE_C_FLAGS "-Wall -O2 -march=armv7-a -mfpu=neon -mfloat-abi=hard")
+else()
+    message(STATUS "Building for macOS (Local Development)")
+    set(CMAKE_C_FLAGS "-Wall -O2")
+endif()
+
+# ============================================================
+#  Source and Header Discovery
+# ============================================================
+# Auto-detect all .c and .h files
+file(GLOB SRC_FILES "${CMAKE_SOURCE_DIR}/src/*.c")
+file(GLOB HEADER_FILES "${CMAKE_SOURCE_DIR}/include/*.h")
+
+# ============================================================
+#  Executable Output
+# ============================================================
+add_executable(pac_rf_exec
+    ${SRC_FILES}
+    ${HEADER_FILES} # Optional for IDEs
+)
+
+# Output binary to bin/
+set_target_properties(pac_rf_exec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
+)
+
+# Include header directory for all modules
+target_include_directories(pac_rf_exec PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# Extra warnings for safety
+if (CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(pac_rf_exec PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Post-build message
+add_custom_command(TARGET pac_rf_exec POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "✅ Build complete: bin/pac_rf_exec ready!"
+)
+
+# ============================================================
+# Developer Notes:
+# ------------------------------------------------------------
+# 1. macOS build = local testing, no ARM flags.
+# 2. Linux build (Ubuntu/PAC-RF) = ARM-optimized flags.
+# 3. Auto-detects new src/*.c and include/*.h automatically.
+# 4. Binary always outputs to bin/pac_rf_exec.
+# 5. For clean rebuild:
+#       rm -rf CMakeFiles CMakeCache.txt Makefile && cmake . && make
+# ============================================================

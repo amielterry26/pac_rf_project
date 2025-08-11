@@ -1,0 +1,4 @@
+/Users/amielterry40/Desktop/pac_rf_project/build/CMakeFiles/pacrf_core.dir
+/Users/amielterry40/Desktop/pac_rf_project/build/CMakeFiles/pac_rf_exec.dir
+/Users/amielterry40/Desktop/pac_rf_project/build/CMakeFiles/edit_cache.dir
+/Users/amielterry40/Desktop/pac_rf_project/build/CMakeFiles/rebuild_cache.dir

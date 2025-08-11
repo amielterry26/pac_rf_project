@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpacrf_core.a CMakeFiles/pacrf_core.dir/src/common/bit_parser.c.o CMakeFiles/pacrf_core.dir/src/common/commands.c.o CMakeFiles/pacrf_core.dir/src/common/handlers.c.o CMakeFiles/pacrf_core.dir/src/common/interface.c.o CMakeFiles/pacrf_core.dir/src/common/logger.c.o CMakeFiles/pacrf_core.dir/src/common/queue_manager.c.o CMakeFiles/pacrf_core.dir/src/common/nmea.c.o
+/usr/bin/ranlib libpacrf_core.a

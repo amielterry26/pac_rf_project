@@ -1,0 +1,384 @@
+// src/gui/main_gui.c
+//
+// PAC-RF GUI (GTK4) — Future-proof, table-driven output handling
+// --------------------------------------------------------------
+// Runs on desktop (Mac/VM). Executes PAC-RF CLI remotely via SSH using
+// run_pacrf_cmd_cb(...) from interface.c, streaming stdout lines back.
+//
+// Output protocol (extensible via handler registry below):
+//   "TERM: ..."  → human-friendly summary
+//   "LOG:  ..."  → raw logs
+//   "IMG:  ..."  → remote image path (future: fetch & display)
+// You can add new prefixes (WARN:, ERR:, JSON:, DATA:, …) without changing
+// core GUI code—just register a handler.
+//
+// Env (optional; sensible defaults):
+//   PACRF_REMOTE_HOST  (default "pacrf")
+//   PACRF_REMOTE_USER  (default "root")
+//   PACRF_REMOTE_PATH  (default "/root/pac_rf_project/bin/pac_rf_exec")
+//   PACRF_SSH_KEY      (optional key path)
+
+#include <gtk/gtk.h>
+#include <glib.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "interface.h"  // run_pacrf_cmd_cb(...)
+#include "logger.h"
+
+// ==============================
+// Application state
+// ==============================
+typedef struct {
+    GtkApplication *gtk_app;    // own the window via GtkApplicationWindow
+    GtkWidget     *window;
+
+    // Controls
+    GtkWidget     *btn_gps;
+    GtkWidget     *btn_capture;
+    GtkWidget     *btn_stream_start;
+    GtkWidget     *btn_stream_stop;
+
+    // Displays
+    GtkWidget     *term_view;
+    GtkTextBuffer *term_buf;
+
+    GtkWidget     *log_view;
+    GtkTextBuffer *log_buf;
+
+    GtkWidget     *img;         // placeholder for future image rendering
+
+    GtkWidget     *status_lbl;  // status line (last operation)
+} App;
+
+// ==============================
+// Text append helpers
+// ==============================
+static void append_to_buffer(GtkTextBuffer *buf, const char *s) {
+    if (!buf || !s) return;
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_insert(buf, &end, s, -1);
+    size_t n = strlen(s);
+    if (n == 0 || s[n-1] != '\n') gtk_text_buffer_insert(buf, &end, "\n", -1);
+}
+
+static void gui_append_term(App *app, const char *msg) { append_to_buffer(app->term_buf, msg); }
+static void gui_append_log (App *app, const char *msg) { append_to_buffer(app->log_buf,  msg); }
+
+// For now, we just log the remote path; later we can scp it and call gtk_image_set_from_file.
+static void gui_handle_image(App *app, const char *remote_path) {
+    char line[512];
+    g_snprintf(line, sizeof(line),
+               "[IMG] Remote image on PAC-RF: %s\n"
+               "[TODO] Fetch and render locally.\n",
+               remote_path ? remote_path : "(null)");
+    gui_append_log(app, line);
+    (void)app; // keep compiler happy if we don't yet display image
+}
+
+// ==============================
+// Main-thread marshaling
+// ==============================
+typedef enum {
+    GUI_MSG_TERM   = 0,
+    GUI_MSG_LOG    = 1,
+    GUI_MSG_IMG    = 2,
+    GUI_MSG_STATUS = 3
+} GuiMsgKind;
+
+typedef struct {
+    App        *app;
+    GuiMsgKind  kind;
+    char       *s;   // owned
+} GuiMsg;
+
+static gboolean gui_dispatch_to_main(gpointer data) {
+    GuiMsg *m = (GuiMsg*)data;
+    if (!m || !m->app) { if (m) g_free(m->s); g_free(m); return FALSE; }
+    switch (m->kind) {
+        case GUI_MSG_TERM:   gui_append_term(m->app, m->s); break;
+        case GUI_MSG_LOG:    gui_append_log(m->app,  m->s); break;
+        case GUI_MSG_IMG:    gui_handle_image(m->app, m->s); break;
+        case GUI_MSG_STATUS:
+            if (m->app->status_lbl) gtk_label_set_text(GTK_LABEL(m->app->status_lbl), m->s ? m->s : "");
+            break;
+        default: break;
+    }
+    g_free(m->s);
+    g_free(m);
+    return FALSE; // one-shot
+}
+
+static void post_gui(App *app, GuiMsgKind kind, const char *s) {
+    GuiMsg *m = g_new0(GuiMsg, 1);
+    m->app = app;
+    m->kind = kind;
+    m->s = g_strdup(s ? s : "");
+    g_idle_add(gui_dispatch_to_main, m);
+}
+
+// ==============================
+// Output handler registry
+// ==============================
+
+typedef struct OutputHandlerEntry OutputHandlerEntry;
+typedef void (*OutputHandlerFn)(App *app, const char *payload);
+
+struct OutputHandlerEntry {
+    const char         *prefix;    // e.g., "TERM: "
+    OutputHandlerFn     fn;        // receives payload after prefix
+    OutputHandlerEntry *next;      // linked list for dynamic registration
+};
+
+static OutputHandlerEntry *g_handlers = NULL;
+
+static void register_output_handler(const char *prefix, OutputHandlerFn fn) {
+    if (!prefix || !*prefix || !fn) return;
+    OutputHandlerEntry *e = g_new0(OutputHandlerEntry, 1);
+    e->prefix = prefix; // should live for program lifetime (string literal or static)
+    e->fn = fn;
+    e->next = g_handlers;
+    g_handlers = e;
+}
+
+// Default handlers (can move to separate module later)
+static void oh_term(App *app, const char *payload) { post_gui(app, GUI_MSG_TERM, payload); }
+static void oh_log (App *app, const char *payload) { post_gui(app, GUI_MSG_LOG,  payload); }
+static void oh_img (App *app, const char *payload) {
+    char *tmp = g_strdup(payload ? payload : "");
+    g_strstrip(tmp);
+    post_gui(app, GUI_MSG_IMG, tmp);
+    g_free(tmp);
+}
+static void oh_warn(App *app, const char *payload) {
+    char *tagged = g_strconcat("[WARN] ", payload ? payload : "", NULL);
+    post_gui(app, GUI_MSG_LOG, tagged);
+    g_free(tagged);
+}
+static void oh_err(App *app, const char *payload) {
+    char *tagged = g_strconcat("[ERROR] ", payload ? payload : "", NULL);
+    post_gui(app, GUI_MSG_LOG, tagged);
+    g_free(tagged);
+}
+static void oh_json(App *app, const char *payload) {
+    // Future: parse JSON and route to widgets; for now, log as-is.
+    post_gui(app, GUI_MSG_LOG, payload ? payload : "");
+}
+
+static void init_default_handlers(void) {
+    register_output_handler("TERM: ", oh_term);
+    register_output_handler("LOG: ",  oh_log);
+    register_output_handler("IMG: ",  oh_img);
+    // forward-looking (harmless if never emitted):
+    register_output_handler("WARN: ", oh_warn);
+    register_output_handler("ERR: ",  oh_err);
+    register_output_handler("JSON: ", oh_json);
+}
+
+// Router: find first matching prefix and invoke handler. Fallback to LOG.
+static void gui_route_line_registered(App *app, const char *line) {
+    for (OutputHandlerEntry *e = g_handlers; e; e = e->next) {
+        if (g_str_has_prefix(line, e->prefix)) {
+            const char *payload = line + strlen(e->prefix);
+            e->fn(app, payload);
+            return;
+        }
+    }
+    post_gui(app, GUI_MSG_LOG, line);
+}
+
+// Adapter for interface.c callback signature
+static void pacrf_on_line_cb(const char *line, void *user) {
+    App *app = (App*)user;
+    gui_route_line_registered(app, line);
+}
+
+// ==============================
+// Workers (background threads)
+// ==============================
+static gpointer gps_worker(gpointer user) {
+    App *app = (App*)user;
+    post_gui(app, GUI_MSG_STATUS, "Running GPS on PAC-RF…");
+    run_pacrf_cmd_cb("--gps", pacrf_on_line_cb, app);
+    post_gui(app, GUI_MSG_STATUS, "GPS finished.");
+    return NULL;
+}
+
+static gpointer capture_worker(gpointer user) {
+    App *app = (App*)user;
+    post_gui(app, GUI_MSG_STATUS, "Running CAPTURE on PAC-RF…");
+    run_pacrf_cmd_cb("--capture", pacrf_on_line_cb, app);
+    post_gui(app, GUI_MSG_STATUS, "Capture finished.");
+    return NULL;
+}
+
+static gpointer stream_start_worker(gpointer user) {
+    App *app = (App*)user;
+    post_gui(app, GUI_MSG_STATUS, "Starting STREAM on PAC-RF…");
+    run_pacrf_cmd_cb("--stream-start", pacrf_on_line_cb, app);
+    post_gui(app, GUI_MSG_STATUS, "Stream start issued.");
+    return NULL;
+}
+
+static gpointer stream_stop_worker(gpointer user) {
+    App *app = (App*)user;
+    post_gui(app, GUI_MSG_STATUS, "Stopping STREAM on PAC-RF…");
+    run_pacrf_cmd_cb("--stream-stop", pacrf_on_line_cb, app);
+    post_gui(app, GUI_MSG_STATUS, "Stream stop issued.");
+    return NULL;
+}
+
+// ==============================
+// Button callbacks (main thread)
+// ==============================
+static void on_btn_gps(GtkButton *btn, gpointer user) {
+    (void)btn;
+    App *app = (App*)user;
+    gtk_text_buffer_set_text(app->term_buf, "", -1);
+    gtk_text_buffer_set_text(app->log_buf,  "", -1);
+    g_thread_new("gps-worker", gps_worker, app);
+}
+
+static void on_btn_capture(GtkButton *btn, gpointer user) {
+    (void)btn;
+    App *app = (App*)user;
+    g_thread_new("capture-worker", capture_worker, app);
+}
+
+static void on_btn_stream_start(GtkButton *btn, gpointer user) {
+    (void)btn;
+    App *app = (App*)user;
+    g_thread_new("stream-start-worker", stream_start_worker, app);
+}
+
+static void on_btn_stream_stop(GtkButton *btn, gpointer user) {
+    (void)btn;
+    App *app = (App*)user;
+    g_thread_new("stream-stop-worker", stream_stop_worker, app);
+}
+
+// ==============================
+// UI Construction (programmatic)
+// ==============================
+static GtkWidget* make_textview_scrolled(GtkTextBuffer **out_buf) {
+    GtkWidget *scr = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scr),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    GtkWidget *tv = gtk_text_view_new();
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(tv), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scr), tv);
+    if (out_buf) *out_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+    return scr;
+}
+
+static void build_ui(App *app) {
+    // Window owned by GtkApplication (GTK4-correct)
+    app->window = gtk_application_window_new(app->gtk_app);
+    gtk_window_set_default_size(GTK_WINDOW(app->window), 1100, 720);
+    gtk_window_set_title(GTK_WINDOW(app->window), "PAC-RF Control (Remote)");
+
+    // Header + buttons
+    GtkWidget *header = gtk_header_bar_new();
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header),
+        gtk_label_new("PAC-RF Control Center"));
+    gtk_window_set_titlebar(GTK_WINDOW(app->window), header);
+
+    app->btn_gps          = gtk_button_new_with_label("GPS");
+    app->btn_capture      = gtk_button_new_with_label("Capture");
+    app->btn_stream_start = gtk_button_new_with_label("Stream Start");
+    app->btn_stream_stop  = gtk_button_new_with_label("Stream Stop");
+
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_gps);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_capture);
+    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_stop);
+    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_start);
+
+    // Root container
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(root, 8);
+    gtk_widget_set_margin_bottom(root, 8);
+    gtk_widget_set_margin_start(root, 8);
+    gtk_widget_set_margin_end(root, 8);
+    gtk_window_set_child(GTK_WINDOW(app->window), root);
+
+    // Status label
+    app->status_lbl = gtk_label_new("Ready.");
+    gtk_box_append(GTK_BOX(root), app->status_lbl);
+
+    // Two columns: left (text), right (image)
+    GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_hexpand(cols, TRUE);
+    gtk_widget_set_vexpand(cols, TRUE);
+    gtk_box_append(GTK_BOX(root), cols);
+
+    // Left: TERM + LOG
+    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_hexpand(left, TRUE);
+    gtk_widget_set_vexpand(left, TRUE);
+
+    GtkWidget *term_lbl = gtk_label_new("Terminal");
+    GtkWidget *term_scr = make_textview_scrolled(&app->term_buf);
+
+    GtkWidget *log_lbl  = gtk_label_new("Logs");
+    GtkWidget *log_scr  = make_textview_scrolled(&app->log_buf);
+
+    gtk_box_append(GTK_BOX(left), term_lbl);
+    gtk_box_append(GTK_BOX(left), term_scr);
+    gtk_box_append(GTK_BOX(left), log_lbl);
+    gtk_box_append(GTK_BOX(left), log_scr);
+
+    // Right: Image placeholder
+    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_hexpand(right, TRUE);
+    gtk_widget_set_vexpand(right, TRUE);
+
+    GtkWidget *img_lbl = gtk_label_new("Image / Spectrum");
+    app->img = gtk_image_new();
+    gtk_widget_set_hexpand(app->img, TRUE);
+    gtk_widget_set_vexpand(app->img, TRUE);
+
+    gtk_box_append(GTK_BOX(right), img_lbl);
+    gtk_box_append(GTK_BOX(right), app->img);
+
+    gtk_box_append(GTK_BOX(cols), left);
+    gtk_box_append(GTK_BOX(cols), right);
+
+    // Save TextView widgets (if needed further)
+    app->term_view = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(term_scr));
+    app->log_view  = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(log_scr));
+
+    // Wire callbacks
+    g_signal_connect(app->btn_gps,          "clicked", G_CALLBACK(on_btn_gps),          app);
+    g_signal_connect(app->btn_capture,      "clicked", G_CALLBACK(on_btn_capture),      app);
+    g_signal_connect(app->btn_stream_start, "clicked", G_CALLBACK(on_btn_stream_start), app);
+    g_signal_connect(app->btn_stream_stop,  "clicked", G_CALLBACK(on_btn_stream_stop),  app);
+
+    // Initial content
+    gtk_text_buffer_set_text(app->term_buf, "Click GPS to run the real PAC-RF handler remotely.\n", -1);
+    gtk_text_buffer_set_text(app->log_buf,  "Logs will stream here.\n", -1);
+}
+
+// ==============================
+// GTK Application wiring
+// ==============================
+static void on_activate(GtkApplication *gtk_app, gpointer user) {
+    (void)user;
+    init_default_handlers();
+
+    App *app = g_new0(App, 1);
+    app->gtk_app = gtk_app;
+    build_ui(app);
+
+    // Present the window (GTK4 way)
+    gtk_window_present(GTK_WINDOW(app->window));
+}
+
+int main(int argc, char **argv) {
+    GtkApplication *gtk_app = gtk_application_new("com.arcane.pacrf", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(gtk_app, "activate", G_CALLBACK(on_activate), NULL);
+    int status = g_application_run(G_APPLICATION(gtk_app), argc, argv);
+    g_object_unref(gtk_app);
+    return status;
+}

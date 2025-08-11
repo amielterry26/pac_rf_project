@@ -1,0 +1,147 @@
+# ===============================================================
+# CMakeLists.txt — Unified Build System for PAC-RF Project
+# ===============================================================
+# Author: Arcane Systems
+#
+# Supports:
+#   - CLI tool (pac_rf_exec)
+#   - GUI interface (pac_rf_gui, GTK4)
+#
+# Features:
+#   • Cross-platform: macOS, Linux, Embedded ARM (future: Windows)
+#   • Modular Targets: Separate CLI and GUI targets
+#   • Dependency Detection: libusb and GTK4 via pkg-config
+#   • Architecture Flags: Optional NEON for ARM
+#   • Tag Annotations: [TAG:XYZ] for grep/debugging/architecture flags
+# ===============================================================
+
+cmake_minimum_required(VERSION 3.15)
+project(pac_rf LANGUAGES C)
+
+# -------------------------------
+# Detect platform
+# -------------------------------
+if(APPLE)
+    set(PLATFORM "macOS")
+    message(STATUS "📦 Building for macOS (Local Development)")
+elseif(UNIX)
+    set(PLATFORM "Linux")
+    message(STATUS "🚀 Building for Linux (Production / Embedded)")
+else()
+    set(PLATFORM "Unknown")
+    message(WARNING "⚠️ Platform not explicitly supported")
+endif()
+
+# -------------------------------
+# Build Options
+# -------------------------------
+option(PACRF_BUILD_GUI "Build GTK4 GUI frontend" ON)
+option(PACRF_WITH_LIBUSB "Build with libusb hardware integration" ON)
+
+# -------------------------------
+# Output Directory
+# -------------------------------
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+
+# -------------------------------
+# Debug Symbols
+# -------------------------------
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -std=gnu99")
+
+# -------------------------------
+# ARM/NEON Flags (Optional)
+# -------------------------------
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
+    if(UNIX AND NOT APPLE)
+        message(STATUS "[SKIP] Generic ARM64 detected — skipping NEON flags for compatibility")
+    else()
+        message(STATUS "[SKIP] ARM detected, but NEON flags skipped on macOS")
+    endif()
+endif()
+
+# -------------------------------
+# Source File Layout
+# -------------------------------
+set(SRC_COMMON
+    src/common/bit_parser.c
+    src/common/commands.c
+    src/common/handlers.c
+    src/common/interface.c
+    src/common/logger.c
+    src/common/queue_manager.c
+    src/common/nmea.c
+)
+
+set(SRC_CLI src/cli/main.c)
+set(SRC_GUI src/gui/main_gui.c)
+
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+# -------------------------------
+# Dependencies: libusb (for CLI)
+# -------------------------------
+if(PACRF_WITH_LIBUSB)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+endif()
+
+# -------------------------------
+# Dependencies: GTK4 (for GUI)
+# -------------------------------
+if(PACRF_BUILD_GUI)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK4 gtk4)
+    if(NOT GTK4_FOUND)
+        message(WARNING "⚠️ GTK4 not found — GUI will be skipped on this platform")
+        set(PACRF_BUILD_GUI OFF)
+    endif()
+endif()
+
+# -------------------------------
+# Core Library (shared by CLI/GUI)
+# -------------------------------
+add_library(pacrf_core ${SRC_COMMON})
+if(PACRF_WITH_LIBUSB)
+    target_include_directories(pacrf_core PRIVATE ${LIBUSB_INCLUDE_DIRS})
+    target_link_directories(pacrf_core PRIVATE ${LIBUSB_LIBRARY_DIRS})
+    target_link_libraries(pacrf_core ${LIBUSB_LIBRARIES})
+    target_compile_options(pacrf_core PRIVATE ${LIBUSB_CFLAGS_OTHER})
+endif()
+
+# -------------------------------
+# CLI Target
+# -------------------------------
+add_executable(pac_rf_exec ${SRC_CLI})
+target_link_libraries(pac_rf_exec pacrf_core)
+
+# -------------------------------
+# GUI Target (Only if GTK4 found)
+# -------------------------------
+if(PACRF_BUILD_GUI)
+    add_executable(pac_rf_gui ${SRC_GUI})
+    target_include_directories(pac_rf_gui PRIVATE ${GTK4_INCLUDE_DIRS})
+    target_link_directories(pac_rf_gui PRIVATE ${GTK4_LIBRARY_DIRS})
+    target_link_libraries(pac_rf_gui pacrf_core ${GTK4_LIBRARIES})
+    target_compile_options(pac_rf_gui PRIVATE ${GTK4_CFLAGS_OTHER})
+endif()
+
+# -------------------------------
+# Build Profile Summary
+# -------------------------------
+message(STATUS "")
+message(STATUS "================ Build Profile ================")
+message(STATUS "Target Platform        : ${PLATFORM}")
+message(STATUS "Architecture           : ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "CLI Target             : ✔ Built (pac_rf_exec)")
+if(PACRF_BUILD_GUI)
+    message(STATUS "GUI Target             : ✔ Built (pac_rf_gui)")
+else()
+    message(STATUS "GUI Target             : ✖ Skipped (GTK4 not found or disabled)")
+endif()
+if(PACRF_WITH_LIBUSB)
+    message(STATUS "libusb Found           : ${LIBUSB_VERSION}")
+else()
+    message(STATUS "libusb Support         : ✖ Disabled")
+endif()
+message(STATUS "NEON Optimization      : ${CMAKE_C_FLAGS}")
+message(STATUS "===============================================")
