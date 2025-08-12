@@ -11,6 +11,13 @@
 #include "interface.h"
 #include "logger.h"
 
+// ---- Compatibility guard --------------------------------------------------
+// Some distros (older GLib/GIO) don't define G_APPLICATION_DEFAULT_FLAGS.
+// Map it to G_APPLICATION_FLAGS_NONE so the code builds everywhere.
+#ifndef G_APPLICATION_DEFAULT_FLAGS
+#define G_APPLICATION_DEFAULT_FLAGS G_APPLICATION_FLAGS_NONE
+#endif
+
 // ==============================
 // Application state
 // ==============================
@@ -156,6 +163,117 @@ static GtkWidget* make_textview_scrolled(GtkTextBuffer **out_buf){
 
 // ==============================
 // Build UI (paned, spacious)
+// ==============================
+static void build_ui(App *app){
+    // Window owned by GtkApplication
+    app->window = gtk_application_window_new(app->gtk_app);
+    gtk_window_set_default_size(GTK_WINDOW(app->window), 1200, 800);
+    gtk_window_set_title(GTK_WINDOW(app->window), "PAC-RF Control Center");
+
+    // Header with buttons
+    GtkWidget *header = gtk_header_bar_new();
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), gtk_label_new("PAC-RF Control Center"));
+    gtk_window_set_titlebar(GTK_WINDOW(app->window), header);
+
+    app->btn_gps          = gtk_button_new_with_label("GPS");
+    app->btn_capture      = gtk_button_new_with_label("Capture");
+    app->btn_stream_start = gtk_button_new_with_label("Stream Start");
+    app->btn_stream_stop  = gtk_button_new_with_label("Stream Stop");
+
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_gps);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_capture);
+    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_stop);
+    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_start);
+
+    // Root vertical box
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(root, 8);
+    gtk_widget_set_margin_bottom(root, 8);
+    gtk_widget_set_margin_start(root, 8);
+    gtk_widget_set_margin_end(root, 8);
+    gtk_window_set_child(GTK_WINDOW(app->window), root);
+
+    // Status label
+    app->status_lbl = gtk_label_new("Ready.");
+    gtk_box_append(GTK_BOX(root), app->status_lbl);
+
+    // Top-level horizontal paned: Left (text) | Right (image)
+    GtkWidget *paned_h = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_hexpand(paned_h, TRUE);
+    gtk_widget_set_vexpand(paned_h, TRUE);
+    gtk_box_append(GTK_BOX(root), paned_h);
+
+    // LEFT: vertical paned: Terminal (top) | Logs (bottom)
+    GtkWidget *paned_v = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_widget_set_hexpand(paned_v, TRUE);
+    gtk_widget_set_vexpand(paned_v, TRUE);
+
+    // Terminal
+    GtkWidget *term_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *term_lbl = gtk_label_new("Terminal");
+    GtkWidget *term_scr = make_textview_scrolled(&app->term_buf);
+    gtk_box_append(GTK_BOX(term_box), term_lbl);
+    gtk_box_append(GTK_BOX(term_box), term_scr);
+    app->term_view = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(term_scr));
+
+    // Logs
+    GtkWidget *log_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *log_lbl = gtk_label_new("Logs");
+    GtkWidget *log_scr = make_textview_scrolled(&app->log_buf);
+    gtk_box_append(GTK_BOX(log_box), log_lbl);
+    gtk_box_append(GTK_BOX(log_box), log_scr);
+    app->log_view = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(log_scr));
+
+    // Pack into vertical paned (give Terminal more height initially)
+    gtk_paned_set_start_child(GTK_PANED(paned_v), term_box);
+    gtk_paned_set_end_child  (GTK_PANED(paned_v), log_box);
+    gtk_paned_set_position   (GTK_PANED(paned_v), 400); // initial divider (pixels)
+
+    // RIGHT: Image panel
+    GtkWidget *img_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *img_lbl = gtk_label_new("Image / Spectrum");
+    app->img = gtk_image_new();
+    gtk_widget_set_hexpand(app->img, TRUE);
+    gtk_widget_set_vexpand(app->img, TRUE);
+    gtk_box_append(GTK_BOX(img_box), img_lbl);
+    gtk_box_append(GTK_BOX(img_box), app->img);
+
+    // Pack into horizontal paned (give text side more width initially)
+    gtk_paned_set_start_child(GTK_PANED(paned_h), paned_v);
+    gtk_paned_set_end_child  (GTK_PANED(paned_h), img_box);
+    gtk_paned_set_position   (GTK_PANED(paned_h), 800); // initial divider (pixels)
+
+    // Wire callbacks
+    g_signal_connect(app->btn_gps,          "clicked", G_CALLBACK(on_btn_gps),          app);
+    g_signal_connect(app->btn_capture,      "clicked", G_CALLBACK(on_btn_capture),      app);
+    g_signal_connect(app->btn_stream_start, "clicked", G_CALLBACK(on_btn_stream_start), app);
+    g_signal_connect(app->btn_stream_stop,  "clicked", G_CALLBACK(on_btn_stream_stop),  app);
+
+    // Initial text
+    gtk_text_buffer_set_text(app->term_buf, "Click GPS to run the real PAC-RF handler remotely.\n", -1);
+    gtk_text_buffer_set_text(app->log_buf,  "Logs will stream here.\n", -1);
+}
+
+// ==============================
+// GTK application wiring
+// ==============================
+static void on_activate(GtkApplication *gtk_app, gpointer user){
+    (void)user;
+    init_default_handlers();
+
+    App *app = g_new0(App,1);
+    app->gtk_app = gtk_app;
+    build_ui(app);
+    gtk_window_present(GTK_WINDOW(app->window));
+}
+
+int main(int argc, char **argv){
+    GtkApplication *gtk_app = gtk_application_new("com.arcane.pacrf", G_APPLICATION_FLAGS_NONE);
+    g_signal_connect(gtk_app, "activate", G_CALLBACK(on_activate), NULL);
+    int status = g_application_run(G_APPLICATION(gtk_app), argc, argv);
+    g_object_unref(gtk_app);
+    return status;
+}// Build UI (paned, spacious)
 // ==============================
 static void build_ui(App *app){
     // Window owned by GtkApplication
