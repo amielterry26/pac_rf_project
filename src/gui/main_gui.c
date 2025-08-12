@@ -44,15 +44,55 @@ typedef struct {
 } App;
 
 // ==============================
-// Text append helpers
+// Text append helpers (UTF-8 safe, info-preserving)
 // ==============================
+// Convert an arbitrary byte string into GTK-safe UTF-8 by hex-escaping any
+// invalid UTF-8 bytes. This preserves all information visually.
+static char* sanitize_to_utf8_with_hex(const char *s) {
+    if (!s) return g_strdup("");
+
+    const unsigned char *p = (const unsigned char*)s;
+    GString *out = g_string_sized_new(strlen(s) + 32);
+
+    while (*p) {
+        // If the remaining string is valid UTF-8, append it and break.
+        if (g_utf8_validate((const char*)p, -1, NULL)) {
+            g_string_append(out, (const char*)p);
+            break;
+        }
+        gunichar ch = g_utf8_get_char_validated((const char*)p, -1);
+        if (ch != (gunichar)-1 && ch != (gunichar)-2) {
+            // Valid Unicode char starting at p
+            char buf[8];
+            int len = g_unichar_to_utf8(ch, buf);
+            g_string_append_len(out, buf, len);
+            p += len;
+        } else {
+            // Invalid byte; hex-escape it losslessly
+            char esc[8];
+            g_snprintf(esc, sizeof(esc), "<0x%02X>", (unsigned int)(*p));
+            g_string_append(out, esc);
+            p += 1;
+        }
+    }
+    return g_string_free(out, FALSE); // heap string
+}
+
 static void append_to_buffer(GtkTextBuffer *buf, const char *s) {
     if (!buf || !s) return;
+
+    char *safe = sanitize_to_utf8_with_hex(s);
+
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_insert(buf, &end, s, -1);
-    size_t n = strlen(s);
-    if (n == 0 || s[n-1] != '\n') gtk_text_buffer_insert(buf, &end, "\n", -1);
+    gtk_text_buffer_insert(buf, &end, safe, -1);
+
+    // Ensure newline for readability
+    size_t n = strlen(safe);
+    if (n == 0 || safe[n-1] != '\n') {
+        gtk_text_buffer_insert(buf, &end, "\n", -1);
+    }
+    g_free(safe);
 }
 static void gui_append_term(App *app, const char *msg){ append_to_buffer(app->term_buf, msg); }
 static void gui_append_log (App *app, const char *msg){ append_to_buffer(app->log_buf,  msg); }
@@ -269,117 +309,6 @@ static void on_activate(GtkApplication *gtk_app, gpointer user){
 
 int main(int argc, char **argv){
     GtkApplication *gtk_app = gtk_application_new("com.arcane.pacrf", G_APPLICATION_FLAGS_NONE);
-    g_signal_connect(gtk_app, "activate", G_CALLBACK(on_activate), NULL);
-    int status = g_application_run(G_APPLICATION(gtk_app), argc, argv);
-    g_object_unref(gtk_app);
-    return status;
-}// Build UI (paned, spacious)
-// ==============================
-static void build_ui(App *app){
-    // Window owned by GtkApplication
-    app->window = gtk_application_window_new(app->gtk_app);
-    gtk_window_set_default_size(GTK_WINDOW(app->window), 1200, 800);
-    gtk_window_set_title(GTK_WINDOW(app->window), "PAC-RF Control Center");
-
-    // Header with buttons
-    GtkWidget *header = gtk_header_bar_new();
-    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), gtk_label_new("PAC-RF Control Center"));
-    gtk_window_set_titlebar(GTK_WINDOW(app->window), header);
-
-    app->btn_gps          = gtk_button_new_with_label("GPS");
-    app->btn_capture      = gtk_button_new_with_label("Capture");
-    app->btn_stream_start = gtk_button_new_with_label("Stream Start");
-    app->btn_stream_stop  = gtk_button_new_with_label("Stream Stop");
-
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_gps);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), app->btn_capture);
-    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_stop);
-    gtk_header_bar_pack_end  (GTK_HEADER_BAR(header), app->btn_stream_start);
-
-    // Root vertical box
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_top(root, 8);
-    gtk_widget_set_margin_bottom(root, 8);
-    gtk_widget_set_margin_start(root, 8);
-    gtk_widget_set_margin_end(root, 8);
-    gtk_window_set_child(GTK_WINDOW(app->window), root);
-
-    // Status label
-    app->status_lbl = gtk_label_new("Ready.");
-    gtk_box_append(GTK_BOX(root), app->status_lbl);
-
-    // Top-level horizontal paned: Left (text) | Right (image)
-    GtkWidget *paned_h = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_widget_set_hexpand(paned_h, TRUE);
-    gtk_widget_set_vexpand(paned_h, TRUE);
-    gtk_box_append(GTK_BOX(root), paned_h);
-
-    // LEFT: vertical paned: Terminal (top) | Logs (bottom)
-    GtkWidget *paned_v = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
-    gtk_widget_set_hexpand(paned_v, TRUE);
-    gtk_widget_set_vexpand(paned_v, TRUE);
-
-    // Terminal
-    GtkWidget *term_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *term_lbl = gtk_label_new("Terminal");
-    GtkWidget *term_scr = make_textview_scrolled(&app->term_buf);
-    gtk_box_append(GTK_BOX(term_box), term_lbl);
-    gtk_box_append(GTK_BOX(term_box), term_scr);
-    app->term_view = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(term_scr));
-
-    // Logs
-    GtkWidget *log_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *log_lbl = gtk_label_new("Logs");
-    GtkWidget *log_scr = make_textview_scrolled(&app->log_buf);
-    gtk_box_append(GTK_BOX(log_box), log_lbl);
-    gtk_box_append(GTK_BOX(log_box), log_scr);
-    app->log_view = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(log_scr));
-
-    // Pack into vertical paned (give Terminal more height initially)
-    gtk_paned_set_start_child(GTK_PANED(paned_v), term_box);
-    gtk_paned_set_end_child  (GTK_PANED(paned_v), log_box);
-    gtk_paned_set_position   (GTK_PANED(paned_v), 400); // initial divider (pixels)
-
-    // RIGHT: Image panel
-    GtkWidget *img_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *img_lbl = gtk_label_new("Image / Spectrum");
-    app->img = gtk_image_new();
-    gtk_widget_set_hexpand(app->img, TRUE);
-    gtk_widget_set_vexpand(app->img, TRUE);
-    gtk_box_append(GTK_BOX(img_box), img_lbl);
-    gtk_box_append(GTK_BOX(img_box), app->img);
-
-    // Pack into horizontal paned (give text side more width initially)
-    gtk_paned_set_start_child(GTK_PANED(paned_h), paned_v);
-    gtk_paned_set_end_child  (GTK_PANED(paned_h), img_box);
-    gtk_paned_set_position   (GTK_PANED(paned_h), 800); // initial divider (pixels)
-
-    // Wire callbacks
-    g_signal_connect(app->btn_gps,          "clicked", G_CALLBACK(on_btn_gps),          app);
-    g_signal_connect(app->btn_capture,      "clicked", G_CALLBACK(on_btn_capture),      app);
-    g_signal_connect(app->btn_stream_start, "clicked", G_CALLBACK(on_btn_stream_start), app);
-    g_signal_connect(app->btn_stream_stop,  "clicked", G_CALLBACK(on_btn_stream_stop),  app);
-
-    // Initial text
-    gtk_text_buffer_set_text(app->term_buf, "Click GPS to run the real PAC-RF handler remotely.\n", -1);
-    gtk_text_buffer_set_text(app->log_buf,  "Logs will stream here.\n", -1);
-}
-
-// ==============================
-// GTK application wiring
-// ==============================
-static void on_activate(GtkApplication *gtk_app, gpointer user){
-    (void)user;
-    init_default_handlers();
-
-    App *app = g_new0(App,1);
-    app->gtk_app = gtk_app;
-    build_ui(app);
-    gtk_window_present(GTK_WINDOW(app->window));
-}
-
-int main(int argc, char **argv){
-    GtkApplication *gtk_app = gtk_application_new("com.arcane.pacrf", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(gtk_app, "activate", G_CALLBACK(on_activate), NULL);
     int status = g_application_run(G_APPLICATION(gtk_app), argc, argv);
     g_object_unref(gtk_app);
